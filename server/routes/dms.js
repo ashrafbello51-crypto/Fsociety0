@@ -283,4 +283,14 @@ router.post('/:id/read', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Typing indicator. Works in both modes: the server publishes to whoever is
+// subscribed to the conversation (in-memory sockets locally, Ably on serverless).
+router.post('/:id/typing', requireAuth, async (req, res) => {
+  const conversationId = parseInt(req.params.id, 10);
+  if (!(await memberOf(conversationId, req.user.id))) return res.status(403).json({ error: 'Forbidden' });
+  const typing = !!(req.body && req.body.typing);
+  realtime.publishConversation(conversationId, { type: 'dm:typing', conversationId, userId: req.user.id, typing });
+  res.json({ ok: true });
+});
+
 module.exports = router;

@@ -1,43 +1,46 @@
 // server/realtime.js
-// Lightweight pub/sub over WebSocket for channel messages, DM conversations, reactions, presence.
+// Pub/sub for channel messages, DM conversations, reactions, presence.
+// Two modes:
+//   - 'ws'   : in-memory WebSocket hub (local dev / self-hosted Node). Used when
+//              ABLY_API_KEY is not set. This is what the integration harness exercises.
+//   - 'ably' : serverless-friendly publish via Ably (https://ably.com). The server
+//              only PUBLISHES; browser clients subscribe directly to Ably channels.
+//              Enabled automatically when ABLY_API_KEY is present (e.g. on Vercel).
 const auth = require('./auth');
 const db = require('./db');
 
+let Ably = null;
+let ably = null; // Ably.Rest client — used to publish + issue client tokens
+let mode = 'ws';
+
 const state = {
   wss: null,
-  // channelId -> Set(ws)
-  channelSockets: new Map(),
-  // userId -> Set(ws)
-  userSockets: new Map(),
-  // conversationId -> Set(ws)
-  conversationSockets: new Map(),
+  channelSockets: new Map(),   // channelId -> Set(ws)
+  userSockets: new Map(),      // userId -> Set(ws)
+  conversationSockets: new Map(), // conversationId -> Set(ws)
 };
 
 function init(wss) {
-  state.wss = wss;
-}
-
-function register(ws, userId) {
-  if (!state.userSockets.has(userId)) state.userSockets.set(userId, new Set());
-  state.userSockets.get(userId).add(ws);
-}
-
-function unregister(ws, userId) {
-  if (userId && state.userSockets.has(userId)) {
-    state.userSockets.get(userId).delete(ws);
+  if (process.env.ABLY_API_KEY) {
+    mode = 'ably';
+    // Required lazily so the Ably package is not needed for local dev / the harness.
+    Ably = require('ably');
+    ably = new Ably.Rest(process.env.ABLY_API_KEY);
+  } else {
+    mode = 'ws';
+    state.wss = wss;
   }
-  state.channelSockets.forEach((set) => set.delete(ws));
-  state.conversationSockets.forEach((set) => set.delete(ws));
 }
 
-function userHasOpenSocket(userId) {
-  const set = state.userSockets.get(userId);
-  return !!(set && set.size > 0);
+function getMode() { return mode; }
+
+function publishAbly(channel, event) {
+  if (!ably) return;
+  ably.channels.get(channel).publish('event', event)
+    .catch((e) => console.error('[ably] publish failed', channel, e.message));
 }
 
-// Authorization helpers — a socket may only subscribe to channels/conversations
-// it is legitimately entitled to see. Without this check, any client could join
-// an arbitrary channel/conversation by id and receive messages it shouldn't.
+// ---- authorization helpers (also used by the token endpoint) ----
 async function canJoinChannel(userId, channelId) {
   const ch = await db.prepare(`SELECT community_id FROM channels WHERE id = ?`).get(channelId);
   if (!ch) return false;
@@ -49,50 +52,51 @@ async function canJoinConversation(userId, conversationId) {
   return !!(await db.prepare(`SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?`).get(conversationId, userId));
 }
 
-// ---- channels ----
+// Issue a subscribe-scoped Ably token for the authenticated user. Capabilities are
+// constrained to channels/conversations the user is actually a member of, so a client
+// cannot subscribe to (and therefore receive) traffic it shouldn't see.
+async function requestToken(clientId, capability) {
+  if (!ably) throw new Error('realtime not configured');
+  return new Promise((resolve, reject) => {
+    ably.auth.requestToken(
+      { clientId: String(clientId), capability, ttl: 60 * 60 * 1000 },
+      (err, token) => (err ? reject(err) : resolve(token))
+    );
+  });
+}
+
+// ---------- WebSocket-mode helpers (unused in 'ably' mode) ----------
+function register(ws, userId) {
+  if (!state.userSockets.has(userId)) state.userSockets.set(userId, new Set());
+  state.userSockets.get(userId).add(ws);
+}
+function unregister(ws, userId) {
+  if (userId && state.userSockets.has(userId)) state.userSockets.get(userId).delete(ws);
+  state.channelSockets.forEach((set) => set.delete(ws));
+  state.conversationSockets.forEach((set) => set.delete(ws));
+}
+function userHasOpenSocket(userId) {
+  const set = state.userSockets.get(userId);
+  return !!(set && set.size > 0);
+}
 async function joinChannel(ws, channelId) {
   if (!(await canJoinChannel(ws.userId, channelId))) return false;
   if (!state.channelSockets.has(channelId)) state.channelSockets.set(channelId, new Set());
   state.channelSockets.get(channelId).add(ws);
   return true;
 }
-
 function leaveChannel(ws, channelId) {
   if (state.channelSockets.has(channelId)) state.channelSockets.get(channelId).delete(ws);
 }
-
-function publish(channelId, event) {
-  const set = state.channelSockets.get(channelId);
-  if (!set) return;
-  const data = JSON.stringify(event);
-  set.forEach((ws) => {
-    if (ws.readyState === 1) ws.send(data);
-  });
-}
-
-// ---- conversations (DMs) ----
 async function joinConversation(ws, conversationId) {
   if (!(await canJoinConversation(ws.userId, conversationId))) return false;
   if (!state.conversationSockets.has(conversationId)) state.conversationSockets.set(conversationId, new Set());
   state.conversationSockets.get(conversationId).add(ws);
   return true;
 }
-
 function leaveConversation(ws, conversationId) {
   if (state.conversationSockets.has(conversationId)) state.conversationSockets.get(conversationId).delete(ws);
 }
-
-// Deliver to every socket subscribed to the conversation, optionally excluding one (e.g. the sender).
-function publishConversation(conversationId, event, excludeWs) {
-  const set = state.conversationSockets.get(conversationId);
-  if (!set) return;
-  const data = JSON.stringify(event);
-  set.forEach((ws) => {
-    if (ws.readyState === 1 && ws !== excludeWs) ws.send(data);
-  });
-}
-
-// Is a given user currently subscribed (has a socket) to this conversation?
 function userInConversation(conversationId, userId) {
   const set = state.conversationSockets.get(conversationId);
   if (!set) return false;
@@ -101,29 +105,42 @@ function userInConversation(conversationId, userId) {
   return found;
 }
 
+// ---------- publish (mode-aware) ----------
+function publish(channelId, event) {
+  if (mode === 'ably') return publishAbly('channel:' + channelId, event);
+  const set = state.channelSockets.get(channelId);
+  if (!set) return;
+  const data = JSON.stringify(event);
+  set.forEach((ws) => { if (ws.readyState === 1) ws.send(data); });
+}
+
+function publishConversation(conversationId, event, excludeWs) {
+  if (mode === 'ably') return publishAbly('conv:' + conversationId, event);
+  const set = state.conversationSockets.get(conversationId);
+  if (!set) return;
+  const data = JSON.stringify(event);
+  set.forEach((ws) => { if (ws.readyState === 1 && ws !== excludeWs) ws.send(data); });
+}
+
 function publishUser(userId, event) {
+  if (mode === 'ably') return publishAbly('user:' + userId, event);
   const set = state.userSockets.get(userId);
   if (!set) return;
   const data = JSON.stringify(event);
-  set.forEach((ws) => {
-    if (ws.readyState === 1) ws.send(data);
-  });
+  set.forEach((ws) => { if (ws.readyState === 1) ws.send(data); });
 }
 
-// Broadcast a presence change to every *other* connected, authenticated user.
+// Presence is client-driven via Ably's presence feature in 'ably' mode; no-op here.
 function broadcastPresence(userId, presenceState) {
+  if (mode === 'ably') return;
   const data = JSON.stringify({ type: 'presence', userId, state: presenceState });
   state.userSockets.forEach((set, uid) => {
     if (uid === userId) return;
     set.forEach((ws) => { if (ws.readyState === 1) ws.send(data); });
   });
 }
-
-// On connect, hand a freshly-registered socket the current presence of every
-// other user who already has an open socket. Without this, an observer that
-// connects after some users are already online would never learn they are online
-// (presence is otherwise only pushed as a delta at the moment of a state change).
 function sendPresenceSnapshot(ws, userId) {
+  if (mode === 'ably') return;
   if (ws.readyState !== 1) return;
   state.userSockets.forEach((set, uid) => {
     if (uid === userId) return;
@@ -131,7 +148,6 @@ function sendPresenceSnapshot(ws, userId) {
   });
 }
 
-// Authenticate a websocket connection from its cookies.
 async function userFromWs(req) {
   const header = req.headers.cookie || '';
   let refresh = null;
@@ -142,7 +158,6 @@ async function userFromWs(req) {
   if (refresh) {
     const u = await auth.getSessionByToken(refresh);
     if (u && u.status !== 'banned') {
-      // Revert a timed mute/suspension whose expiry has passed.
       if ((u.status === 'muted' || u.status === 'suspended') && u.expires_at) {
         if (new Date(u.expires_at).getTime() <= Date.now()) u.status = 'active';
       }
@@ -153,8 +168,9 @@ async function userFromWs(req) {
 }
 
 module.exports = {
-  init, register, unregister, userHasOpenSocket,
+  init, getMode, register, unregister, userHasOpenSocket,
   joinChannel, leaveChannel, publish, publishUser,
   joinConversation, leaveConversation, publishConversation, userInConversation,
   broadcastPresence, sendPresenceSnapshot, userFromWs, canJoinChannel, canJoinConversation,
+  requestToken,
 };

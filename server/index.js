@@ -25,6 +25,7 @@ const uploadsRouter = require('./routes/uploads');
 const adminRouter = require('./routes/admin');
 const moderationRouter = require('./routes/moderation');
 const searchRouter = require('./routes/search');
+const realtimeRouter = require('./routes/realtime');
 
 const app = express();
 
@@ -96,6 +97,7 @@ app.use('/api/uploads', uploadsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/moderation', moderationRouter);
 app.use('/api/search', searchRouter);
+app.use('/api/realtime', realtimeRouter);
 
 // 404 for unknown API
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

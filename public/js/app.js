@@ -46,53 +46,143 @@
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const hasPerm = (p) => state.permissions.includes(p);
 
-  // ---------- WebSocket ----------
+  // ---------- Realtime (native WebSocket locally, Ably on serverless) ----------
+  const rt = { mode: 'ws', ably: null, connected: false, desiredChannels: new Set(), desiredConvs: new Set(), subs: new Map() };
+
+  // Single dispatch path for both transports.
+  function handleRealtimeEvent(msg) {
+    if (!msg || !msg.type) return;
+    if (msg.type === 'message:new' && state.activeChannel && msg.channelId === state.activeChannel.id) {
+      if (state.messages.find((m) => m.id === msg.message.id)) return;
+      state.messages.push(msg.message); appendMessage(msg.message); scrollMessages();
+    } else if (msg.type === 'message:delete' && state.activeChannel && msg.channelId === state.activeChannel.id) {
+      state.messages = state.messages.filter((m) => m.id !== msg.messageId);
+      const node = document.getElementById('msg-' + msg.messageId); if (node) node.remove();
+    } else if (msg.type === 'message:reaction' && state.activeChannel && msg.channelId === state.activeChannel.id) {
+      const node = document.getElementById('msg-' + msg.messageId);
+      if (node) { const r = $('.msg-reactions', node); if (r) r.innerHTML = renderReactions(msg.reactions); }
+    } else if (msg.type === 'notification:new') {
+      loadNotifications();
+    } else if (msg.type === 'presence') {
+      updatePresence(msg.userId, msg.state);
+    } else if (msg.type === 'dm:new') {
+      if (state.activeConversation && msg.conversationId === state.activeConversation.id) {
+        if (state.dmMessages.find((m) => m.id === msg.message.id)) return;
+        state.dmMessages.push(msg.message); appendDMMessage(msg.message); scrollDM();
+        API.post(`/conversations/${state.activeConversation.id}/read`).catch(() => {});
+      } else { refreshConversations(); }
+    } else if (msg.type === 'dm:reaction' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
+      const node = document.getElementById('dm-' + msg.messageId);
+      if (node) { const r = $('.msg-reactions', node); if (r) r.innerHTML = renderReactions(msg.reactions); }
+    } else if (msg.type === 'dm:delete' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
+      const node = document.getElementById('dm-' + msg.messageId);
+      if (node) { const body = $('.dm-body', node); if (body) { body.textContent = '[ deleted ]'; body.classList.add('opacity-40', 'italic'); } }
+    } else if (msg.type === 'dm:typing' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
+      showTyping(msg.userId, msg.typing);
+    } else if (msg.type === 'dm:read' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
+      refreshConversations();
+    }
+  }
+
+  async function connectRealtime() {
+    if (!state.user) return;
+    let cfg = { mode: 'ws' };
+    try { cfg = await API.get('/realtime/config'); } catch {}
+    rt.mode = cfg.mode || 'ws';
+    if (rt.mode === 'ably' && window.Ably) await connectAbly();
+    else connectWS();
+  }
+
   function connectWS() {
     if (state.ws && state.ws.readyState === 1) return;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
     state.ws = ws;
-    ws.onmessage = (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'message:new' && state.activeChannel && msg.channelId === state.activeChannel.id) {
-        state.messages.push(msg.message);
-        appendMessage(msg.message);
-        scrollMessages();
-      } else if (msg.type === 'message:delete' && state.activeChannel && msg.channelId === state.activeChannel.id) {
-        state.messages = state.messages.filter((m) => m.id !== msg.messageId);
-        const node = document.getElementById('msg-' + msg.messageId);
-        if (node) node.remove();
-      } else if (msg.type === 'message:reaction' && state.activeChannel && msg.channelId === state.activeChannel.id) {
-        const node = document.getElementById('msg-' + msg.messageId);
-        if (node) { const r = $('.msg-reactions', node); if (r) r.innerHTML = renderReactions(msg.reactions); }
-      } else if (msg.type === 'notification:new') {
-        loadNotifications();
-      } else if (msg.type === 'presence') {
-        updatePresence(msg.userId, msg.state);
-      } else if (msg.type === 'dm:new') {
-        if (state.activeConversation && msg.conversationId === state.activeConversation.id) {
-          state.dmMessages.push(msg.message);
-          appendDMMessage(msg.message);
-          scrollDM();
-          API.post(`/conversations/${state.activeConversation.id}/read`).catch(() => {});
-        } else {
-          refreshConversations();
-        }
-      } else if (msg.type === 'dm:reaction' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
-        const node = document.getElementById('dm-' + msg.messageId);
-        if (node) { const r = $('.msg-reactions', node); if (r) r.innerHTML = renderReactions(msg.reactions); }
-      } else if (msg.type === 'dm:delete' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
-        const node = document.getElementById('dm-' + msg.messageId);
-        if (node) { const body = $('.dm-body', node); if (body) { body.textContent = '[ deleted ]'; body.classList.add('opacity-40', 'italic'); } }
-      } else if (msg.type === 'dm:typing' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
-        showTyping(msg.userId, msg.typing);
-      } else if (msg.type === 'dm:read' && state.activeConversation && msg.conversationId === state.activeConversation.id) {
-        refreshConversations();
-      }
-    };
-    ws.onclose = () => { setTimeout(() => { if (state.user) connectWS(); }, 2000); };
+    ws.onopen = () => { rt.connected = true; };
+    ws.onmessage = (ev) => { let msg; try { msg = JSON.parse(ev.data); } catch { return; } handleRealtimeEvent(msg); };
+    ws.onclose = () => { rt.connected = false; setTimeout(() => { if (state.user) connectRealtime(); }, 2000); };
   }
-  function wsSend(obj) { if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj)); }
+
+  async function connectAbly() {
+    rt.ably = new Ably.Realtime({ clientId: String(state.user.id), authCallback: ablyAuth });
+    rt.ably.connection.on('connected', () => {
+      rt.connected = true;
+      subscribeAbly('user:' + state.user.id);
+      subscribeAbly('global:presence');
+      enterPresence();
+    });
+    rt.ably.connection.on('failed', () => { rt.connected = false; });
+    rt.ably.connection.on('closed', () => { rt.connected = false; });
+  }
+
+  async function ablyAuth(params, callback) {
+    try {
+      const tok = await API.post('/realtime/token', {
+        channels: Array.from(rt.desiredChannels),
+        conversations: Array.from(rt.desiredConvs),
+      });
+      callback(null, tok);
+    } catch (e) { callback(e); }
+  }
+
+  function subscribeAbly(name) {
+    if (!rt.ably || rt.subs.has(name)) return;
+    if (name.startsWith('channel:')) rt.desiredChannels.add(parseInt(name.slice(8), 10));
+    else if (name.startsWith('conv:')) rt.desiredConvs.add(parseInt(name.slice(5), 10));
+    if (rt.ably.auth.isAuthorized) rt.ably.auth.authorize().catch(() => {});
+    const ch = rt.ably.channels.get(name);
+    ch.subscribe((message) => handleRealtimeEvent(message.data)).catch(() => {});
+    rt.subs.set(name, ch);
+  }
+
+  function unsubscribeAbly(name) {
+    if (!rt.subs.has(name)) return;
+    rt.subs.get(name).unsubscribe().catch(() => {});
+    rt.subs.delete(name);
+  }
+
+  function enterPresence() {
+    const pc = rt.ably.channels.get('global:presence');
+    pc.presence.enter().catch(() => {});
+    pc.presence.subscribe('enter', (m) => updatePresence(parseInt(m.clientId, 10), 'online'));
+    pc.presence.subscribe('leave', (m) => updatePresence(parseInt(m.clientId, 10), 'offline'));
+    pc.presence.subscribe('update', (m) => updatePresence(parseInt(m.clientId, 10), (m.data && m.data.state) || 'online'));
+  }
+
+  // Send-side. In Ably mode the only client->server realtime action is the typing
+  // indicator (everything else is published by the server after an authorized REST call).
+  function wsSend(obj) {
+    if (rt.mode === 'ably') {
+      if (obj.type === 'dm:typing' && obj.conversationId) {
+        API.post(`/conversations/${obj.conversationId}/typing`, { typing: !!obj.typing }).catch(() => {});
+      }
+      return;
+    }
+    if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+  }
+
+  function joinChannelRealtime(id) {
+    if (rt.mode === 'ably') subscribeAbly('channel:' + id);
+    else joinChannelRealtime(id);
+  }
+  function leaveChannelRealtime(id) {
+    if (rt.mode === 'ably') unsubscribeAbly('channel:' + id);
+    else wsSend({ type: 'leave', channelId: id });
+  }
+  function joinConvRealtime(id) {
+    if (rt.mode === 'ably') subscribeAbly('conv:' + id);
+    else joinConvRealtime(id);
+  }
+  function leaveConvRealtime(id) {
+    if (rt.mode === 'ably') unsubscribeAbly('conv:' + id);
+    else leaveConvRealtime(id);
+  }
+  function disconnectRealtime() {
+    if (rt.mode === 'ably' && rt.ably) {
+      rt.ably.channels.get('global:presence').presence.leave().catch(() => {});
+      rt.ably.close();
+    } else if (state.ws) { state.ws.close(); }
+  }
 
   // ---------- notifications ----------
   state.notifications = [];
@@ -685,7 +775,7 @@
     bindDMForm();
     scrollDM();
     await API.post(`/conversations/${id}/read`).catch(() => {});
-    wsSend({ type: 'dm:join', conversationId: id });
+    joinConvRealtime(id);
     refreshConversations();
   }
 
@@ -693,7 +783,7 @@
     const prev = state.activeConversation;
     await loadConversations();
     const next = selectedId ? state.conversations.find((c) => c.id === selectedId) || null : null;
-    if (prev && (!next || prev.id !== next.id)) wsSend({ type: 'dm:leave', conversationId: prev.id });
+    if (prev && (!next || prev.id !== next.id)) leaveConvRealtime(prev.id);
     state.activeConversation = next;
     state.dmMessages = [];
     $('#app').innerHTML = renderDMWorkspace();
@@ -726,7 +816,7 @@
       try {
         const r = await API.post(`/conversations/${state.activeConversation.id}/messages`, payload);
         resetComposer(form);
-        if (!(state.ws && state.ws.readyState === 1)) {
+        if (!rt.connected) {
           state.dmMessages.push(r.message);
           appendDMMessage(r.message);
           scrollDM();
@@ -1135,7 +1225,7 @@
 
     // Leave any open DM socket subscription when navigating away from the DM area.
     if (state.activeConversation && !hash.startsWith('#/dm/') && hash !== '#/messages') {
-      wsSend({ type: 'dm:leave', conversationId: state.activeConversation.id });
+      leaveConvRealtime(state.activeConversation.id);
       state.activeConversation = null;
     }
 
@@ -1196,7 +1286,7 @@
       if (node) { node.scrollIntoView({ block: 'center' }); node.classList.add('ring-2', 'ring-primary-fixed-dim'); }
       state.pendingScrollMessageId = null;
     }
-    wsSend({ type: 'join', channelId: state.activeChannel.id });
+    joinChannelRealtime(state.activeChannel.id);
     loadNotifications();
     loadAnnouncements(communityId);
     const ba = $('#btn-announcements'); if (ba) ba.addEventListener('click', () => $('#announcements').classList.toggle('hidden'));
@@ -1280,7 +1370,7 @@
       try {
         const r = await API.post(`/channels/${state.activeChannel.id}/messages`, payload);
         resetComposer(form);
-        if (!(state.ws && state.ws.readyState === 1)) {
+        if (!rt.connected) {
           state.messages.push(r.message);
           appendMessage(r.message);
           scrollMessages();
@@ -1307,7 +1397,7 @@
 
   async function logout() {
     try { await API.post('/auth/logout'); } catch {}
-    state.user = null; state.ws && state.ws.close();
+    state.user = null; disconnectRealtime();
     location.hash = '#/';
     router();
   }
@@ -1315,7 +1405,7 @@
   async function bootstrapUser() {
     const me = await API.get('/auth/me');
     state.user = me.user; state.profile = me.profile; state.roles = me.roles; state.permissions = me.permissions;
-    connectWS();
+    connectRealtime();
     loadNotifications();
   }
 
