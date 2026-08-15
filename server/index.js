@@ -190,8 +190,12 @@ wss.on('close', () => clearInterval(heartbeat));
 // Seed on boot (idempotent).
 seed().catch((e) => console.error('Seed error:', e.message));
 
-server.listen(config.port, config.host, () => {
-  console.log(`F SOCIETY running on http://${config.host}:${config.port} (${config.env})`);
-});
+// Vercel runs this file as a serverless function (no persistent port). Only
+// start a long-lived listener when running as a normal Node process (local/dev).
+if (!process.env.VERCEL) {
+  server.listen(config.port, config.host, () => {
+    console.log(`F SOCIETY running on http://${config.host}:${config.port} (${config.env})`);
+  });
+}
 
-module.exports = { app, server };
+module.exports = app;
